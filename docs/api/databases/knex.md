@@ -286,32 +286,65 @@ This works well for individual properties, however if you require the complete (
 
 ## Transactions
 
-The Knex adapter comes with three hooks that allows to run service method calls in a transaction. They can be used as application wide hooks or per service like this:
+Transactions are essential for maintaining data consistency when performing multiple database operations that should succeed or fail as a single unit. The Knex adapter provides powerful transaction support through three specialized hooks that work together to manage transaction lifecycle.
+
+### How Transactions Work
+
+The Knex adapter transaction system consists of three hooks that manage the complete lifecycle of a database transaction:
+
+1. **`transaction.start()`** - Creates a new transaction or reuses an existing one from the parent context
+2. **`transaction.end()`** - Commits the transaction if all operations were successful
+3. **`transaction.rollback()`** - Rolls back all changes if an error occurs
+
+When a request begins:
+- A new Knex transaction is created and attached to `params.transaction`
+- All subsequent database operations within that request context use this transaction
+- If the request completes successfully, all changes are committed atomically
+- If any error occurs, all changes are rolled back, ensuring data consistency
+
+The transaction object stored in `params.transaction` contains:
+- The Knex transaction instance
+- A `committed` promise that resolves when the transaction completes
+- Nested transaction tracking for complex service interactions
+
+### Basic Transaction Setup
+
+Transactions can be configured at the application level (affecting all services) or at individual service levels:
+
+#### Application-wide Transactions
 
 ```ts
+// src/app.ts
 import { transaction } from '@feathersjs/knex'
 
-// A configure function that registers the service and its hooks via `app.configure`
-export const message = (app: Application) => {
-  // Register our service on the Feathers application
-  app.use('messages', new MessageService(getOptions(app)), {
-    // A list of all methods this service exposes externally
+app.hooks({
+  before: {
+    all: [transaction.start()]
+  },
+  after: {
+    all: [transaction.end()]
+  },
+  error: {
+    all: [transaction.rollback()]
+  }
+})
+```
+
+#### Service-level Transactions
+
+```ts
+// src/services/orders/orders.ts
+import { transaction } from '@feathersjs/knex'
+
+export const orders = (app: Application) => {
+  app.use('orders', new OrderService(options), {
     methods: ['find', 'get', 'create', 'patch', 'remove'],
-    // You can add additional custom events to be sent to clients here
     events: []
   })
-  // Initialize hooks
-  app.service('messages').hooks({
-    around: {
-      all: []
-    },
+  
+  app.service('orders').hooks({
     before: {
-      all: [transaction.start()],
-      find: [],
-      get: [],
-      create: [],
-      patch: [],
-      remove: []
+      all: [transaction.start()]
     },
     after: {
       all: [transaction.end()]
@@ -323,37 +356,416 @@ export const message = (app: Application) => {
 }
 ```
 
-To use the transactions feature, you must ensure that the three hooks (start, end and rollback) are being used.
+### Using the Around Hook
 
-At the start of any request, a new transaction will be started. All the changes made during the request to the services that are using knex will use the transaction. At the end of the request, if sucessful, the changes will be commited. If an error occurs, the changes will be forfeit, all the `creates`, `patches`, `updates` and `deletes` are not going to be commited.
-
-The object that contains `transaction` is stored in the `params.transaction` of each request.
-
-<BlockQuote type="warning" label="Important">
-
-If you call another Knex service within a hook and want to share the transaction you will have to pass `context.params.transaction` in the parameters of the service call.
-
-</BlockQuote>
-
-Sometimes it can be important to know when the transaction has been completed (committed or rolled back). For example, we might want to wait for transaction to complete before we send out any realtime events. This can be done by awaiting on the `transaction.committed` promise which will always resolve to either `true` in case the transaction has been committed, or `false` in case the transaction has been rejected.
+The `around` hook provides a cleaner way to manage transactions by wrapping the entire operation:
 
 ```ts
-app.service('messages').publish(async (data, context) => {
+import { transaction } from '@feathersjs/knex'
+
+app.service('orders').hooks({
+  around: {
+    all: [
+      async (context, next) => {
+        // Start transaction
+        await transaction.start()(context)
+        
+        try {
+          // Execute the service method
+          await next()
+          
+          // Commit on success
+          await transaction.end()(context)
+        } catch (error) {
+          // Rollback on error
+          await transaction.rollback()(context)
+          throw error
+        }
+      }
+    ]
+  }
+})
+```
+
+### Comprehensive Example: Order and Shipping System
+
+Here's a real-world example demonstrating transactions with nested service calls. When creating an order, we automatically create a shipping order. If either operation fails, everything is rolled back:
+
+#### Schema Definitions
+
+```ts
+// src/services/orders/orders.schema.ts
+import { Type } from '@feathersjs/typebox'
+import type { Static } from '@feathersjs/typebox'
+
+export const orderSchema = Type.Object(
+  {
+    id: Type.Number(),
+    customerId: Type.Number(),
+    productId: Type.Number(),
+    quantity: Type.Number(),
+    totalAmount: Type.Number(),
+    status: Type.String(),
+    createdAt: Type.String({ format: 'date-time' }),
+    updatedAt: Type.String({ format: 'date-time' })
+  },
+  { $id: 'Order', additionalProperties: false }
+)
+
+export type Order = Static<typeof orderSchema>
+export type OrderData = Omit<Order, 'id' | 'createdAt' | 'updatedAt'>
+
+// src/services/shipping-orders/shipping-orders.schema.ts
+import { Type } from '@feathersjs/typebox'
+import type { Static } from '@feathersjs/typebox'
+
+export const shippingOrderSchema = Type.Object(
+  {
+    id: Type.Number(),
+    orderId: Type.Number(),
+    shippingAddress: Type.String(),
+    shippingMethod: Type.String(),
+    estimatedDelivery: Type.String({ format: 'date-time' }),
+    trackingNumber: Type.Optional(Type.String()),
+    status: Type.String(),
+    createdAt: Type.String({ format: 'date-time' }),
+    updatedAt: Type.String({ format: 'date-time' })
+  },
+  { $id: 'ShippingOrder', additionalProperties: false }
+)
+
+export type ShippingOrder = Static<typeof shippingOrderSchema>
+export type ShippingOrderData = Omit<ShippingOrder, 'id' | 'createdAt' | 'updatedAt'>
+```
+
+#### Service Implementation with Transactions
+
+```ts
+// src/services/orders/orders.class.ts
+import { KnexService } from '@feathersjs/knex'
+import type { KnexAdapterParams } from '@feathersjs/knex'
+import type { Application } from '../../declarations'
+import type { Order, OrderData } from './orders.schema'
+
+export class OrderService extends KnexService<Order, OrderData> {
+  constructor(options: any) {
+    super(options)
+  }
+}
+
+// src/services/orders/orders.ts
+import { transaction } from '@feathersjs/knex'
+import { hooks as schemaHooks } from '@feathersjs/schema'
+import type { Application } from '../../declarations'
+import { OrderService } from './orders.class'
+
+export const orders = (app: Application) => {
+  const options = {
+    paginate: app.get('paginate'),
+    Model: app.get('knexClient'),
+    name: 'orders'
+  }
+
+  app.use('orders', new OrderService(options), {
+    methods: ['find', 'get', 'create', 'patch', 'remove'],
+    events: []
+  })
+
+  app.service('orders').hooks({
+    around: {
+      all: [schemaHooks.resolveExternal(), schemaHooks.resolveResult()]
+    },
+    before: {
+      all: [
+        transaction.start(),
+        schemaHooks.validateQuery(),
+        schemaHooks.resolveQuery()
+      ],
+      create: [
+        schemaHooks.validateData(),
+        schemaHooks.resolveData(),
+        async (context) => {
+          // This hook automatically creates a shipping order after order creation
+          context.params.createShipping = true
+          return context
+        }
+      ]
+    },
+    after: {
+      all: [transaction.end()],
+      create: [
+        async (context) => {
+          if (context.params.createShipping) {
+            const { transaction } = context.params
+            
+            try {
+              // Create shipping order using the same transaction
+              const shippingOrder = await app.service('shipping-orders').create(
+                {
+                  orderId: context.result.id,
+                  shippingAddress: context.data.shippingAddress || 'Default Address',
+                  shippingMethod: context.data.shippingMethod || 'Standard',
+                  estimatedDelivery: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+                  status: 'pending'
+                },
+                {
+                  ...context.params,
+                  transaction // Pass the transaction to nested service call
+                }
+              )
+              
+              // Attach shipping order to result
+              context.result.shippingOrder = shippingOrder
+            } catch (error) {
+              // If shipping order creation fails, the transaction will be rolled back
+              throw new Error(`Failed to create shipping order: ${error.message}`)
+            }
+          }
+          return context
+        }
+      ]
+    },
+    error: {
+      all: [transaction.rollback()]
+    }
+  })
+}
+```
+
+#### Nested Transactions Example
+
+```ts
+// src/services/shipping-orders/shipping-orders.ts
+import { transaction } from '@feathersjs/knex'
+import type { Application } from '../../declarations'
+import { ShippingOrderService } from './shipping-orders.class'
+
+export const shippingOrders = (app: Application) => {
+  const options = {
+    paginate: app.get('paginate'),
+    Model: app.get('knexClient'),
+    name: 'shipping_orders'
+  }
+
+  app.use('shipping-orders', new ShippingOrderService(options), {
+    methods: ['find', 'get', 'create', 'patch', 'remove'],
+    events: []
+  })
+
+  app.service('shipping-orders').hooks({
+    before: {
+      all: [
+        transaction.start() // Will reuse parent transaction if exists
+      ],
+      create: [
+        async (context) => {
+          // Validate that the order exists
+          const order = await app.service('orders').get(context.data.orderId, {
+            transaction: context.params.transaction // Use same transaction
+          })
+          
+          if (!order) {
+            throw new Error('Order not found')
+          }
+          
+          // Additional validation
+          if (order.status === 'cancelled') {
+            throw new Error('Cannot create shipping for cancelled order')
+          }
+          
+          return context
+        }
+      ]
+    },
+    after: {
+      all: [transaction.end()]
+    },
+    error: {
+      all: [transaction.rollback()]
+    }
+  })
+}
+```
+
+### Error Handling in Transactions
+
+Proper error handling is crucial for transaction integrity. The transaction system automatically handles rollbacks when errors occur, but you can also implement custom error handling:
+
+#### Basic Error Handling
+
+```ts
+app.service('orders').hooks({
+  error: {
+    all: [
+      transaction.rollback(),
+      async (context) => {
+        // Log transaction failure
+        console.error('Transaction failed:', {
+          service: context.path,
+          method: context.method,
+          error: context.error.message,
+          data: context.data
+        })
+        
+        // You can modify the error message for the client
+        if (context.error.message.includes('shipping')) {
+          context.error.message = 'Order creation failed: Unable to setup shipping'
+        }
+        
+        return context
+      }
+    ]
+  }
+})
+```
+
+#### Advanced Error Handling with Retry Logic
+
+```ts
+async function withTransactionRetry(fn, maxRetries = 3) {
+  let lastError
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      
+      // Check if error is retryable (e.g., deadlock)
+      if (error.code === 'ER_LOCK_DEADLOCK' && attempt < maxRetries) {
+        console.log(`Transaction deadlock detected, retrying (${attempt}/${maxRetries})...`)
+        await new Promise(resolve => setTimeout(resolve, 100 * attempt))
+        continue
+      }
+      
+      throw error
+    }
+  }
+  
+  throw lastError
+}
+
+// Usage in a hook
+app.service('orders').hooks({
+  before: {
+    create: [
+      async (context) => {
+        context.result = await withTransactionRetry(async () => {
+          // Your transactional logic here
+          return await context.service._create(context.data, context.params)
+        })
+        
+        return context
+      }
+    ]
+  }
+})
+```
+
+### Waiting for Transaction Completion
+
+When dealing with real-time events or external systems, you may need to wait for transaction completion:
+
+```ts
+app.service('orders').publish(async (data, context) => {
   const { transaction } = context.params
 
   if (transaction) {
+    // Wait for transaction to complete
     const success = await transaction.committed
 
     if (!success) {
+      // Transaction was rolled back, don't send events
       return []
     }
   }
 
-  return app.channel(`rooms/${data.roomId}`)
+  // Transaction committed successfully, send real-time updates
+  return app.channel(`customers/${data.customerId}`)
 })
 ```
 
-This also works with nested service calls and nested transactions. For example, if a service calls `transaction.start()` and passes the transaction param to a nested service call, which also calls `transaction.start()` in it's own hooks, they will share the top most `committed` promise that will resolve once all of the transactions have succesfully committed.
+### Testing Transactions
+
+Here's an example of testing transaction behavior:
+
+```ts
+// test/services/orders.test.ts
+import assert from 'assert'
+import { app } from '../../src/app'
+
+describe('Order Transactions', () => {
+  it('rolls back order when shipping creation fails', async () => {
+    // Mock shipping service to fail
+    const originalCreate = app.service('shipping-orders')._create
+    app.service('shipping-orders')._create = async () => {
+      throw new Error('Shipping service unavailable')
+    }
+
+    try {
+      // Attempt to create order (should fail and rollback)
+      await app.service('orders').create({
+        customerId: 1,
+        productId: 1,
+        quantity: 2,
+        totalAmount: 100,
+        status: 'pending'
+      })
+      
+      assert.fail('Should have thrown an error')
+    } catch (error) {
+      assert.equal(error.message.includes('shipping'), true)
+    }
+
+    // Verify order was not created
+    const orders = await app.service('orders').find({
+      query: { customerId: 1 }
+    })
+    assert.equal(orders.total, 0)
+
+    // Restore original method
+    app.service('shipping-orders')._create = originalCreate
+  })
+
+  it('successfully creates order with shipping in transaction', async () => {
+    const order = await app.service('orders').create({
+      customerId: 1,
+      productId: 1,
+      quantity: 2,
+      totalAmount: 100,
+      status: 'pending',
+      shippingAddress: '123 Main St',
+      shippingMethod: 'Express'
+    })
+
+    assert.ok(order.id)
+    assert.ok(order.shippingOrder)
+    assert.equal(order.shippingOrder.orderId, order.id)
+  })
+})
+```
+
+### Important Considerations
+
+<BlockQuote type="warning" label="Important">
+
+When calling another Knex service within a hook and you want to share the transaction, you must pass `context.params.transaction` in the parameters of the service call. Failing to do so will result in the nested service call executing outside the transaction context.
+
+</BlockQuote>
+
+<BlockQuote type="info" label="Best Practices">
+
+1. Always use all three transaction hooks (start, end, rollback) together
+2. Pass the transaction parameter to all nested service calls
+3. Handle errors appropriately to ensure proper rollback
+4. Use the `committed` promise when coordinating with external systems
+5. Test transaction rollback scenarios thoroughly
+6. Consider using the `around` hook for cleaner transaction management
+7. Be aware that long-running transactions can cause database locks
+
+</BlockQuote>
+
+This also works with nested service calls and nested transactions. For example, if a service calls `transaction.start()` and passes the transaction param to a nested service call, which also calls `transaction.start()` in its own hooks, they will share the top-most `committed` promise that will resolve once all of the transactions have successfully committed.
 
 ## Error handling
 
